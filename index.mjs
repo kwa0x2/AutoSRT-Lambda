@@ -29,7 +29,7 @@ const apiClient = axios.create({
   maxBodyLength: Infinity
 });
 
-const processInChunks = async (audioFile, chunkSize = 2 * 1024 * 1024) => { // 2mb chunks
+const processInChunks = async (audioFile, chunkSize = 1 * 1024 * 1024) => { // 1mb chunks
   const chunks = [];
   for (let i = 0; i < audioFile.length; i += chunkSize) {
     chunks.push(audioFile.slice(i, i + chunkSize));

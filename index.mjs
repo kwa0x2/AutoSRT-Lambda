@@ -1,6 +1,10 @@
 import AWS from 'aws-sdk';
 import axios from 'axios';
 import FormData from 'form-data';
+import { exec } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import util from 'util';
 
 const s3Client = new AWS.S3({
   maxRetries: 3,
@@ -14,7 +18,8 @@ const CONFIG = {
   OPENAI_API_URL: 'https://api.openai.com/v1/audio/transcriptions',
   OPENAI_API_KEY: API_KEY,
   WHISPER_MODEL: 'whisper-1',
-  BUCKET_NAME: 'autosrt'
+  BUCKET_NAME: BUCKET_NAME,
+  FFMPEG_PATH: '/opt/bin/ffmpeg'
 };
 
 const apiClient = axios.create({
@@ -27,7 +32,29 @@ const apiClient = axios.create({
   maxBodyLength: Infinity
 });
 
-const processInChunks = async (audioFile, chunkSize = 1 * 1024 * 1024) => { // 1mb chunks
+const convertMp4ToMp3 = async (mp4FilePath, mp3FilePath) => {
+  const command = `${CONFIG.FFMPEG_PATH} -i ${mp4FilePath} \
+    -vn \
+    -acodec libmp3lame \
+    -ar 16000 \
+    -ac 1 \
+    -af "volume=1.5,highpass=f=200,lowpass=f=3000,afftdn=nf=-25" \
+    -q:a 0 \
+    -map_metadata -1 \
+    -id3v2_version 0 \
+    ${mp3FilePath}`;
+  
+  const execPromise = util.promisify(exec);
+  
+  try {
+    await execPromise(command);
+  } catch (error) {
+    throw new Error(`FFmpeg error: ${error.message}`);
+  }
+};
+
+
+const processInChunks = async (audioFile, chunkSize = 1 * 1024 * 1024) => { // 2mb chunks
   const chunks = [];
   for (let i = 0; i < audioFile.length; i += chunkSize) {
     chunks.push(audioFile.slice(i, i + chunkSize));
@@ -171,16 +198,27 @@ export const handler = async (event) => {
       throw new Error('Missing required parameters');
     }
 
+    const tmpDir = '/tmp/';
+    const mp4FilePath = path.join(tmpDir, `${fileKey}`);
+    const mp3FilePath = path.join(tmpDir, `${userId}_${fileKey.replace('.mp4', '.mp3')}`);
+
     console.time('s3-fetch');
     const audioFile = await s3Client
       .getObject({ Bucket: CONFIG.BUCKET_NAME, Key: fileKey })
       .promise()
       .then(data => data.Body);
+    fs.writeFileSync(mp4FilePath, audioFile); 
     console.timeEnd('s3-fetch');
 
+    console.time('ffmpeg-conversion');
+    await convertMp4ToMp3(mp4FilePath, mp3FilePath);
+    console.timeEnd('ffmpeg-conversion');
+
     console.time('whisper-api');
-    const chunkResponses = await processInChunks(audioFile);
+    const audioFileBuffer = fs.readFileSync(mp3FilePath);
+    const chunkResponses = await processInChunks(audioFileBuffer);
     console.timeEnd('whisper-api');
+
 
     console.time('srt-generation');
     const combinedTranscription = {
@@ -192,7 +230,7 @@ export const handler = async (event) => {
     console.timeEnd('srt-generation');
 
     console.time('s3-upload');
-    const srtFileKey = `${userId}_${fileKey.replace('.mp3', '.srt')}`;
+    const srtFileKey = `${userId}_${fileKey.replace('.mp4', '.srt')}`;
     await s3Client
       .putObject({
         Bucket: CONFIG.BUCKET_NAME,

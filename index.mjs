@@ -1,51 +1,75 @@
-import AWS from 'aws-sdk';
-import axios from 'axios';
-import FormData from 'form-data';
-import { exec } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import util from 'util';
-
-const s3Client = new AWS.S3({
-  maxRetries: 3,
-  httpOptions: {
-    timeout: 300000, // 5 min
-    connectTimeout: 5000
-  }
-});
+import AWS from "aws-sdk";
+import axios from "axios";
+import FormData from "form-data";
+import { exec } from "child_process";
+import fs from "fs";
+import path from "path";
+import util from "util";
 
 const CONFIG = {
-  OPENAI_API_URL: 'https://api.openai.com/v1/audio/transcriptions',
-  OPENAI_API_KEY: API_KEY,
-  WHISPER_MODEL: 'whisper-1',
+  // AWS Config
+  AWS_REGION: AWS_REGION,
   BUCKET_NAME: BUCKET_NAME,
-  FFMPEG_PATH: '/opt/bin/ffmpeg'
+  MAX_RETRIES: 3,
+  TIMEOUT: 300000, // 5 min
+  CONNECT_TIMEOUT: 5000,
+
+  // OpenAI Config
+  OPENAI_API_URL: "https://api.openai.com/v1/audio/transcriptions",
+  OPENAI_API_KEY: API_KEY,
+  WHISPER_MODEL: "whisper-1",
+
+  // FFMPEG Config
+  FFMPEG_PATH: "/opt/bin/ffmpeg",
+  FFMPEG_SAMPLE_RATE: 16000,
+  FFMPEG_CHANNELS: 1,
+  FFMPEG_VOLUME: 1.5,
+  FFMPEG_HIGHPASS: 200,
+  FFMPEG_LOWPASS: 3000,
+  FFMPEG_NOISE_FILTER: -25,
+
+  // File Paths
+  VIDEOS_PATH: "videos",
+  SRT_FILES_PATH: "srt-files",
+  TMP_DIR: "/tmp/",
+
+  // Chunk Config
+  CHUNK_SIZE: 1 * 1024 * 1024, // 2MB
 };
+
+const s3Client = new AWS.S3({
+  region: CONFIG.AWS_REGION,
+  maxRetries: CONFIG.MAX_RETRIES,
+  httpOptions: {
+    timeout: CONFIG.TIMEOUT,
+    connectTimeout: CONFIG.CONNECT_TIMEOUT,
+  },
+});
 
 const apiClient = axios.create({
   baseURL: CONFIG.OPENAI_API_URL,
   headers: {
-    'Authorization': `Bearer ${CONFIG.OPENAI_API_KEY}`,
+    Authorization: `Bearer ${CONFIG.OPENAI_API_KEY}`,
   },
-  timeout: 300000, // 5 min
+  timeout: CONFIG.TIMEOUT,
   maxContentLength: Infinity,
-  maxBodyLength: Infinity
+  maxBodyLength: Infinity,
 });
 
 const convertMp4ToMp3 = async (mp4FilePath, mp3FilePath) => {
   const command = `${CONFIG.FFMPEG_PATH} -i ${mp4FilePath} \
     -vn \
     -acodec libmp3lame \
-    -ar 16000 \
-    -ac 1 \
-    -af "volume=1.5,highpass=f=200,lowpass=f=3000,afftdn=nf=-25" \
+    -ar ${CONFIG.FFMPEG_SAMPLE_RATE} \
+    -ac ${CONFIG.FFMPEG_CHANNELS} \
+    -af "volume=${CONFIG.FFMPEG_VOLUME},highpass=f=${CONFIG.FFMPEG_HIGHPASS},lowpass=f=${CONFIG.FFMPEG_LOWPASS},afftdn=nf=${CONFIG.FFMPEG_NOISE_FILTER}" \
     -q:a 0 \
     -map_metadata -1 \
     -id3v2_version 0 \
     ${mp3FilePath}`;
-  
+
   const execPromise = util.promisify(exec);
-  
+
   try {
     await execPromise(command);
   } catch (error) {
@@ -53,8 +77,7 @@ const convertMp4ToMp3 = async (mp4FilePath, mp3FilePath) => {
   }
 };
 
-
-const processInChunks = async (audioFile, chunkSize = 1 * 1024 * 1024) => { // 2mb chunks
+const processInChunks = async (audioFile, chunkSize = CONFIG.CHUNK_SIZE) => {
   const chunks = [];
   for (let i = 0; i < audioFile.length; i += chunkSize) {
     chunks.push(audioFile.slice(i, i + chunkSize));
@@ -62,15 +85,15 @@ const processInChunks = async (audioFile, chunkSize = 1 * 1024 * 1024) => { // 2
 
   const promises = chunks.map(async (chunk, index) => {
     const form = new FormData();
-    form.append('file', chunk, `chunk_${index}.mp3`);
-    form.append('model', CONFIG.WHISPER_MODEL);
-    form.append('response_format', 'verbose_json');
-    form.append('timestamp_granularities[]', 'word');
+    form.append("file", chunk, `chunk_${index}.mp3`);
+    form.append("model", CONFIG.WHISPER_MODEL);
+    form.append("response_format", "verbose_json");
+    form.append("timestamp_granularities[]", "word");
 
-    return apiClient.post('', form, {
+    return apiClient.post("", form, {
       headers: {
-        'Content-Type': `multipart/form-data; boundary=${form._boundary}`
-      }
+        "Content-Type": `multipart/form-data; boundary=${form.getBoundary()}`,
+      },
     });
   });
 
@@ -87,11 +110,7 @@ class SrtGenerator {
   }
 
   static pad(num, length = 2) {
-    return num.toString().padStart(length, '0');
-  }
-
-  static normalizeWord(word) {
-    return word.replace(/[.,!?'"]/g, '').toLowerCase().trim();
+    return num.toString().padStart(length, "0");
   }
 
   static findWordMatches(textWords, apiWords) {
@@ -101,22 +120,22 @@ class SrtGenerator {
     let currentGroup = [];
 
     while (currentTextIndex < textWords.length && currentApiIndex < apiWords.length) {
-      const textWord = this.normalizeWord(textWords[currentTextIndex]);
-      const apiWord = this.normalizeWord(apiWords[currentApiIndex].word);
-      
+      const textWord = textWords[currentTextIndex];
+      const apiWord = apiWords[currentApiIndex].word;
+
       if (textWord.includes(apiWord)) {
         currentGroup.push(apiWords[currentApiIndex]);
-                
+
         const combinedApiWords = currentGroup
-          .map(w => this.normalizeWord(w.word))
-          .join('');
-        
+          .map((w) => w.word)
+          .join("");
+
         if (textWord === combinedApiWords) {
           matches.push({
             textWord: textWords[currentTextIndex],
             apiWords: currentGroup,
             startTime: currentGroup[0].start,
-            endTime: currentGroup[currentGroup.length - 1].end
+            endTime: currentGroup[currentGroup.length - 1].end,
           });
           currentGroup = [];
           currentTextIndex++;
@@ -128,7 +147,7 @@ class SrtGenerator {
             textWord: textWords[currentTextIndex],
             apiWords: currentGroup,
             startTime: currentGroup[0].start,
-            endTime: currentGroup[currentGroup.length - 1].end
+            endTime: currentGroup[currentGroup.length - 1].end,
           });
         }
         currentGroup = [];
@@ -139,125 +158,168 @@ class SrtGenerator {
     return matches;
   }
 
-  static generate(verboseJson, wordsPerLine) {
+  static generate(verboseJson, wordsPerLine, punctuation = false, considerPunctuation = true) {
     if (!verboseJson?.text || !verboseJson?.words) {
-      throw new Error('Invalid verbose JSON format');
+      throw new Error("Invalid verbose JSON format");
     }
 
-    const textWords = verboseJson.text.trim().split(' ');
-    const wordMatches = this.findWordMatches(textWords, verboseJson.words);
-    
+    const textWords = verboseJson.text.trim().split(" ");
+    let entries = [];
+
+    if (punctuation) {
+      const wordMatches = this.findWordMatches(textWords, verboseJson.words);
+      entries = wordMatches.map(match => ({
+        text: match.textWord,
+        startTime: match.startTime,
+        endTime: match.endTime
+      }));
+    } else {
+      entries = verboseJson.words.map(word => ({
+        text: word.word,
+        startTime: word.start,
+        endTime: word.end
+      }));
+    }
+
     const srtEntries = [];
     let currentEntry = {
       counter: 1,
       startTime: 0,
-      words: []
+      words: [],
     };
 
-    wordMatches.forEach((match, i) => {
+    let duration = 0;
+
+    entries.forEach((entry, i) => {
       if (currentEntry.words.length === 0) {
-        currentEntry.startTime = match.startTime;
+        currentEntry.startTime = entry.startTime;
       }
 
-      currentEntry.words.push(match.textWord);
+      currentEntry.words.push(entry.text);
+      duration = Math.max(duration, entry.endTime);
 
-      const isLastWord = i === wordMatches.length - 1;
-      const hasEndPunctuation = match.textWord.match(/[.!?]$/);
+      const isLastWord = i === entries.length - 1;
+      const hasEndPunctuation = considerPunctuation ? entry.text.match(/[.!?]$/) : false;
       const reachedWordLimit = currentEntry.words.length === wordsPerLine;
 
       if (isLastWord || hasEndPunctuation || reachedWordLimit) {
         srtEntries.push({
           counter: currentEntry.counter,
           startTime: currentEntry.startTime,
-          endTime: match.endTime,
-          text: currentEntry.words.join(' ')
+          endTime: entry.endTime,
+          text: currentEntry.words.join(" "),
         });
 
         currentEntry = {
           counter: currentEntry.counter + 1,
           startTime: 0,
-          words: []
+          words: [],
         };
       }
     });
 
-    return srtEntries
-      .map(entry => (
-        `${entry.counter}\n${this.formatTime(entry.startTime)} --> ${this.formatTime(entry.endTime)}\n${entry.text}\n\n`
-      ))
-      .join('');
+    return {
+      content: srtEntries
+        .map((entry) => `${entry.counter}\n${this.formatTime(entry.startTime)} --> ${this.formatTime(entry.endTime)}\n${entry.text}\n\n`)
+        .join(""),
+      duration: parseFloat(duration.toFixed(2)),
+    };
   }
 }
 
 export const handler = async (event) => {
   try {
-    console.time('total-execution');
-    const { file_name: fileKey, user_id: userId, words_per_line: wordsPerLine } = event;
-    
-    if (!fileKey || !userId || !wordsPerLine) {
-      throw new Error('Missing required parameters');
+    console.time("total-execution");
+    const { file_name, user_id, words_per_line, punctuation, consider_punctuation } = event;
+
+    if (!file_name || !user_id || !words_per_line || 
+        typeof punctuation !== 'boolean' || 
+        typeof consider_punctuation !== 'boolean') {
+      return {
+        status_code: 400,
+        body: {
+          message: "Missing required parameters. Please try again later or contact support.",
+          srt_url: "",
+          duration: 0,
+        },
+      };
     }
 
-    const tmpDir = '/tmp/';
-    const mp4FilePath = path.join(tmpDir, `${fileKey}`);
-    const mp3FilePath = path.join(tmpDir, `${userId}_${fileKey.replace('.mp4', '.mp3')}`);
+    if (!punctuation && consider_punctuation) {
+    return {
+      status_code: 400,
+      body: {
+        message: "Consider Punctuation cannot be true when punctuation is false",
+        srt_url: "",
+        duration: 0,
+      },
+    };
+  }
 
-    console.time('s3-fetch');
+    const mp4FilePath = path.join(CONFIG.TMP_DIR, file_name);
+    const mp3FilePath = path.join(CONFIG.TMP_DIR, file_name.replace(".mp4", ".mp3"));
+
+    console.time("s3-fetch");
     const audioFile = await s3Client
-      .getObject({ Bucket: CONFIG.BUCKET_NAME, Key: fileKey })
+      .getObject({
+        Bucket: CONFIG.BUCKET_NAME,
+        Key: `${CONFIG.VIDEOS_PATH}/${user_id}/${file_name}`,
+      })
       .promise()
-      .then(data => data.Body);
-    fs.writeFileSync(mp4FilePath, audioFile); 
-    console.timeEnd('s3-fetch');
+      .then((data) => data.Body);
+    fs.writeFileSync(mp4FilePath, audioFile);
+    console.timeEnd("s3-fetch");
 
-    console.time('ffmpeg-conversion');
+    console.time("ffmpeg-conversion");
     await convertMp4ToMp3(mp4FilePath, mp3FilePath);
-    console.timeEnd('ffmpeg-conversion');
+    console.timeEnd("ffmpeg-conversion");
 
-    console.time('whisper-api');
+    console.time("whisper-api");
     const audioFileBuffer = fs.readFileSync(mp3FilePath);
     const chunkResponses = await processInChunks(audioFileBuffer);
-    console.timeEnd('whisper-api');
+    console.timeEnd("whisper-api");
 
-
-    console.time('srt-generation');
+    console.time("srt-generation");
     const combinedTranscription = {
-      text: chunkResponses.map(res => res.data.text).join(' '),
-      words: chunkResponses.flatMap(res => res.data.words)
+      text: chunkResponses.map((res) => res.data.text).join(" "),
+      words: chunkResponses.flatMap((res) => res.data.words),
     };
 
-    const srtContent = SrtGenerator.generate(combinedTranscription, wordsPerLine);
-    console.timeEnd('srt-generation');
+    const srtResult = SrtGenerator.generate(combinedTranscription, words_per_line, punctuation, consider_punctuation);
+    console.timeEnd("srt-generation");
 
-    console.time('s3-upload');
-    const srtFileKey = `${userId}_${fileKey.replace('.mp4', '.srt')}`;
+    console.time("s3-upload");
+    const srtFileKey = `${CONFIG.SRT_FILES_PATH}/${user_id}/${file_name.replace(".mp4", ".srt")}`;
     await s3Client
       .putObject({
         Bucket: CONFIG.BUCKET_NAME,
         Key: srtFileKey,
-        Body: srtContent,
-        ContentType: 'application/x-subrip',
+        Body: srtResult.content,
+        ContentType: "application/x-subrip",
       })
       .promise();
-    console.timeEnd('s3-upload');
+    console.timeEnd("s3-upload");
 
-    console.timeEnd('total-execution');
-    
+    const s3Url = `https://${CONFIG.BUCKET_NAME}.s3.amazonaws.com/${srtFileKey}`;
+
+    console.timeEnd("total-execution");
+
     return {
-      statusCode: 200,
-      body: JSON.stringify({
-        message: `SRT file successfully saved: ${srtFileKey}`
-      })
+      status_code: 200,
+      body: {
+        message: "success",
+        srt_url: s3Url,
+        duration: srtResult.duration,
+      },
     };
-
-  } catch (error) {    
+  } catch (error) {
     return {
-      statusCode: error.response?.status || 500,
-      body: JSON.stringify({
-        message: 'An error occurred during the process',
-        error: error.message,
-        details: error.response?.data
-      })
+      status_code: error.response?.status || 500,
+      body: {
+        message: "An error occurred. Please try again later or contact support.",
+        srt_url: "",
+        duration: 0,
+      },
     };
   }
-};
+}; 

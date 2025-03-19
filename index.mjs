@@ -1,10 +1,7 @@
 import AWS from "aws-sdk";
 import axios from "axios";
 import FormData from "form-data";
-import { exec } from "child_process";
-import fs from "fs";
 import path from "path";
-import util from "util";
 
 const CONFIG = {
   // AWS Config
@@ -16,25 +13,12 @@ const CONFIG = {
 
   // OpenAI Config
   OPENAI_API_URL: "https://api.openai.com/v1/audio/transcriptions",
-  OPENAI_API_KEY: API_KEY,
+  OPENAI_API_KEY: OPENAI_API_KEY,
   WHISPER_MODEL: "whisper-1",
 
-  // FFMPEG Config
-  FFMPEG_PATH: "/opt/bin/ffmpeg",
-  FFMPEG_SAMPLE_RATE: 16000,
-  FFMPEG_CHANNELS: 1,
-  FFMPEG_VOLUME: 1.5,
-  FFMPEG_HIGHPASS: 200,
-  FFMPEG_LOWPASS: 3000,
-  FFMPEG_NOISE_FILTER: -25,
-
   // File Paths
-  VIDEOS_PATH: "videos",
+  FILES_PATH: "files",
   SRT_FILES_PATH: "srt-files",
-  TMP_DIR: "/tmp/",
-
-  // Chunk Config
-  CHUNK_SIZE: 1 * 1024 * 1024, // 2MB
 };
 
 const s3Client = new AWS.S3({
@@ -56,48 +40,30 @@ const apiClient = axios.create({
   maxBodyLength: Infinity,
 });
 
-const convertMp4ToMp3 = async (mp4FilePath, mp3FilePath) => {
-  const command = `${CONFIG.FFMPEG_PATH} -i ${mp4FilePath} \
-    -vn \
-    -acodec libmp3lame \
-    -ar ${CONFIG.FFMPEG_SAMPLE_RATE} \
-    -ac ${CONFIG.FFMPEG_CHANNELS} \
-    -af "volume=${CONFIG.FFMPEG_VOLUME},highpass=f=${CONFIG.FFMPEG_HIGHPASS},lowpass=f=${CONFIG.FFMPEG_LOWPASS},afftdn=nf=${CONFIG.FFMPEG_NOISE_FILTER}" \
-    -q:a 0 \
-    -map_metadata -1 \
-    -id3v2_version 0 \
-    ${mp3FilePath}`;
+const processFile = async (file, fileExtension) => {
+  const form = new FormData();
 
-  const execPromise = util.promisify(exec);
+  const contentTypeMap = {
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+  };
 
-  try {
-    await execPromise(command);
-  } catch (error) {
-    throw new Error(`FFmpeg error: ${error.message}`);
-  }
-};
-
-const processInChunks = async (audioFile, chunkSize = CONFIG.CHUNK_SIZE) => {
-  const chunks = [];
-  for (let i = 0; i < audioFile.length; i += chunkSize) {
-    chunks.push(audioFile.slice(i, i + chunkSize));
-  }
-
-  const promises = chunks.map(async (chunk, index) => {
-    const form = new FormData();
-    form.append("file", chunk, `chunk_${index}.mp3`);
-    form.append("model", CONFIG.WHISPER_MODEL);
-    form.append("response_format", "verbose_json");
-    form.append("timestamp_granularities[]", "word");
-
-    return apiClient.post("", form, {
-      headers: {
-        "Content-Type": `multipart/form-data; boundary=${form.getBoundary()}`,
-      },
-    });
+  form.append("file", Buffer.from(file), {
+    filename: `video${fileExtension}`,
+    contentType: contentTypeMap[fileExtension] || "application/octet-stream",
   });
 
-  return Promise.all(promises);
+  form.append("model", CONFIG.WHISPER_MODEL);
+  form.append("response_format", "verbose_json");
+  form.append("timestamp_granularities[]", "word");
+
+  form.append("prompt", "Bu bir video transkripsiyonudur.");
+
+  const response = await apiClient.post("", form, {
+    headers: form.getHeaders(),
+  });
+  return [response];
 };
 
 class SrtGenerator {
@@ -106,7 +72,10 @@ class SrtGenerator {
     const milliseconds = Math.round((time - seconds) * 1000);
     const minutes = Math.floor(seconds / 60);
     const formattedSeconds = seconds % 60;
-    return `${this.pad(minutes)}:${this.pad(formattedSeconds)}.${this.pad(milliseconds, 3)}`;
+    return `${this.pad(minutes)}:${this.pad(formattedSeconds)}.${this.pad(
+      milliseconds,
+      3
+    )}`;
   }
 
   static pad(num, length = 2) {
@@ -119,16 +88,17 @@ class SrtGenerator {
     let currentApiIndex = 0;
     let currentGroup = [];
 
-    while (currentTextIndex < textWords.length && currentApiIndex < apiWords.length) {
+    while (
+      currentTextIndex < textWords.length &&
+      currentApiIndex < apiWords.length
+    ) {
       const textWord = textWords[currentTextIndex];
       const apiWord = apiWords[currentApiIndex].word;
 
       if (textWord.includes(apiWord)) {
         currentGroup.push(apiWords[currentApiIndex]);
 
-        const combinedApiWords = currentGroup
-          .map((w) => w.word)
-          .join("");
+        const combinedApiWords = currentGroup.map((w) => w.word).join("");
 
         if (textWord === combinedApiWords) {
           matches.push({
@@ -158,7 +128,12 @@ class SrtGenerator {
     return matches;
   }
 
-  static generate(verboseJson, wordsPerLine, punctuation = false, considerPunctuation = true) {
+  static generate(
+    verboseJson,
+    wordsPerLine,
+    punctuation = false,
+    considerPunctuation = true
+  ) {
     if (!verboseJson?.text || !verboseJson?.words) {
       throw new Error("Invalid verbose JSON format");
     }
@@ -168,16 +143,16 @@ class SrtGenerator {
 
     if (punctuation) {
       const wordMatches = this.findWordMatches(textWords, verboseJson.words);
-      entries = wordMatches.map(match => ({
+      entries = wordMatches.map((match) => ({
         text: match.textWord,
         startTime: match.startTime,
-        endTime: match.endTime
+        endTime: match.endTime,
       }));
     } else {
-      entries = verboseJson.words.map(word => ({
+      entries = verboseJson.words.map((word) => ({
         text: word.word,
         startTime: word.start,
-        endTime: word.end
+        endTime: word.end,
       }));
     }
 
@@ -199,7 +174,9 @@ class SrtGenerator {
       duration = Math.max(duration, entry.endTime);
 
       const isLastWord = i === entries.length - 1;
-      const hasEndPunctuation = considerPunctuation ? entry.text.match(/[.!?]$/) : false;
+      const hasEndPunctuation = considerPunctuation
+        ? entry.text.match(/[.!?]$/)
+        : false;
       const reachedWordLimit = currentEntry.words.length === wordsPerLine;
 
       if (isLastWord || hasEndPunctuation || reachedWordLimit) {
@@ -220,7 +197,12 @@ class SrtGenerator {
 
     return {
       content: srtEntries
-        .map((entry) => `${entry.counter}\n${this.formatTime(entry.startTime)} --> ${this.formatTime(entry.endTime)}\n${entry.text}\n\n`)
+        .map(
+          (entry) =>
+            `${entry.counter}\n${this.formatTime(
+              entry.startTime
+            )} --> ${this.formatTime(entry.endTime)}\n${entry.text}\n\n`
+        )
         .join(""),
       duration: parseFloat(duration.toFixed(2)),
     };
@@ -230,15 +212,53 @@ class SrtGenerator {
 export const handler = async (event) => {
   try {
     console.time("total-execution");
-    const { file_name, user_id, words_per_line, punctuation, consider_punctuation } = event;
+    const {
+      file_name,
+      user_id,
+      words_per_line,
+      punctuation,
+      consider_punctuation,
+    } = event;
 
-    if (!file_name || !user_id || !words_per_line || 
-        typeof punctuation !== 'boolean' || 
-        typeof consider_punctuation !== 'boolean') {
+    if (
+      !file_name ||
+      !user_id ||
+      !words_per_line ||
+      typeof punctuation !== "boolean" ||
+      typeof consider_punctuation !== "boolean"
+    ) {
       return {
         status_code: 400,
         body: {
-          message: "Missing required parameters. Please try again later or contact support.",
+          message:
+            "Missing required parameters. Please try again later or contact support.",
+          srt_url: "",
+          duration: 0,
+        },
+      };
+    }
+
+    if (words_per_line < 0 || words_per_line > 5) {
+      return {
+        status_code: 400,
+        body: {
+          message: "words_per_line must be between 1 and 5.",
+          srt_url: "",
+          duration: 0,
+        },
+      };
+    }
+
+    const fileExtension = path.extname(file_name).toLowerCase();
+    const allowedExtensions = [".mp4", ".mp3", ".wav"];
+
+    if (!allowedExtensions.includes(fileExtension)) {
+      return {
+        status_code: 400,
+        body: {
+          message: `Invalid file type. Only ${allowedExtensions.join(
+            ", "
+          )} files are allowed.`,
           srt_url: "",
           duration: 0,
         },
@@ -246,37 +266,35 @@ export const handler = async (event) => {
     }
 
     if (!punctuation && consider_punctuation) {
-    return {
-      status_code: 400,
-      body: {
-        message: "Consider Punctuation cannot be true when punctuation is false",
-        srt_url: "",
-        duration: 0,
-      },
-    };
-  }
+      return {
+        status_code: 400,
+        body: {
+          message:
+            "Consider Punctuation cannot be true when punctuation is false",
+          srt_url: "",
+          duration: 0,
+        },
+      };
+    }
 
-    const mp4FilePath = path.join(CONFIG.TMP_DIR, file_name);
-    const mp3FilePath = path.join(CONFIG.TMP_DIR, file_name.replace(".mp4", ".mp3"));
+    const fileKey = `${CONFIG.FILES_PATH}/${user_id}/${file_name}`;
+    const srtFileKey = `${CONFIG.SRT_FILES_PATH}/${user_id}/${file_name.replace(
+      /\.(mp4|mp3|wav)$/i,
+      ".srt"
+    )}`;
 
     console.time("s3-fetch");
-    const audioFile = await s3Client
+    const file = await s3Client
       .getObject({
         Bucket: CONFIG.BUCKET_NAME,
-        Key: `${CONFIG.VIDEOS_PATH}/${user_id}/${file_name}`,
+        Key: fileKey,
       })
       .promise()
       .then((data) => data.Body);
-    fs.writeFileSync(mp4FilePath, audioFile);
     console.timeEnd("s3-fetch");
 
-    console.time("ffmpeg-conversion");
-    await convertMp4ToMp3(mp4FilePath, mp3FilePath);
-    console.timeEnd("ffmpeg-conversion");
-
     console.time("whisper-api");
-    const audioFileBuffer = fs.readFileSync(mp3FilePath);
-    const chunkResponses = await processInChunks(audioFileBuffer);
+    const chunkResponses = await processFile(file, fileExtension);
     console.timeEnd("whisper-api");
 
     console.time("srt-generation");
@@ -285,22 +303,26 @@ export const handler = async (event) => {
       words: chunkResponses.flatMap((res) => res.data.words),
     };
 
-    const srtResult = SrtGenerator.generate(combinedTranscription, words_per_line, punctuation, consider_punctuation);
+    const srtResult = SrtGenerator.generate(
+      combinedTranscription,
+      words_per_line,
+      punctuation,
+      consider_punctuation
+    );
     console.timeEnd("srt-generation");
 
     console.time("s3-upload");
-    const srtFileKey = `${CONFIG.SRT_FILES_PATH}/${user_id}/${file_name.replace(".mp4", ".srt")}`;
-    await s3Client
-      .putObject({
+    const uploadResult = await s3Client
+      .upload({
         Bucket: CONFIG.BUCKET_NAME,
         Key: srtFileKey,
         Body: srtResult.content,
         ContentType: "application/x-subrip",
       })
       .promise();
+    
+    const s3Url = uploadResult.Location;
     console.timeEnd("s3-upload");
-
-    const s3Url = `https://${CONFIG.BUCKET_NAME}.s3.amazonaws.com/${srtFileKey}`;
 
     console.timeEnd("total-execution");
 
@@ -316,10 +338,11 @@ export const handler = async (event) => {
     return {
       status_code: error.response?.status || 500,
       body: {
-        message: "An error occurred. Please try again later or contact support.",
+        message:
+          "An error occurred. Please try again later or contact support.",
         srt_url: "",
         duration: 0,
       },
     };
   }
-}; 
+};

@@ -163,7 +163,6 @@ class SrtGenerator {
       words: [],
     };
 
-    let duration = 0;
 
     entries.forEach((entry, i) => {
       if (currentEntry.words.length === 0) {
@@ -171,7 +170,6 @@ class SrtGenerator {
       }
 
       currentEntry.words.push(entry.text);
-      duration = Math.max(duration, entry.endTime);
 
       const isLastWord = i === entries.length - 1;
       const hasEndPunctuation = considerPunctuation
@@ -204,7 +202,6 @@ class SrtGenerator {
             )} --> ${this.formatTime(entry.endTime)}\n${entry.text}\n\n`
         )
         .join(""),
-      duration: parseFloat(duration.toFixed(2)),
     };
   }
 }
@@ -225,7 +222,7 @@ export const handler = async (event) => {
       !user_id ||
       !words_per_line ||
       typeof punctuation !== "boolean" ||
-      typeof consider_punctuation !== "boolean"
+      typeof consider_punctuation !== "boolean" 
     ) {
       return {
         status_code: 400,
@@ -233,7 +230,6 @@ export const handler = async (event) => {
           message:
             "Missing required parameters. Please try again later or contact support.",
           srt_url: "",
-          duration: 0,
         },
       };
     }
@@ -244,7 +240,6 @@ export const handler = async (event) => {
         body: {
           message: "words_per_line must be between 1 and 5.",
           srt_url: "",
-          duration: 0,
         },
       };
     }
@@ -260,7 +255,6 @@ export const handler = async (event) => {
             ", "
           )} files are allowed.`,
           srt_url: "",
-          duration: 0,
         },
       };
     }
@@ -272,7 +266,6 @@ export const handler = async (event) => {
           message:
             "Consider Punctuation cannot be true when punctuation is false",
           srt_url: "",
-          duration: 0,
         },
       };
     }
@@ -320,7 +313,7 @@ export const handler = async (event) => {
         ContentType: "application/x-subrip",
       })
       .promise();
-    
+
     const s3Url = uploadResult.Location;
     console.timeEnd("s3-upload");
 
@@ -329,19 +322,16 @@ export const handler = async (event) => {
     return {
       status_code: 200,
       body: {
-        message: "success",
+        message: "SRT file generated successfully!",
         srt_url: s3Url,
-        duration: srtResult.duration,
       },
     };
   } catch (error) {
     return {
       status_code: error.response?.status || 500,
       body: {
-        message:
-          "An error occurred. Please try again later or contact support.",
+        message: error.response?.data?.error?.message || error.message || "An error occurred while processing your request.",
         srt_url: "",
-        duration: 0,
       },
     };
   }
